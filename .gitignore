@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+*.duckdb
+*.duckdb.wal
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+frontend/dist/
+.next/
+.vscode/
+scripts/raw_*.json
+plan_draft.txt
+problems_readme.txt
