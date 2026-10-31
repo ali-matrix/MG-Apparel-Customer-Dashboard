@@ -56,7 +56,22 @@ If the customer asks to change or cancel an order, or makes a complaint, set int
 6. "expected ship date" is the date we currently expect to ship. If it was revised, say so and mention the original date.
 7. Keep replies under 80 words. Plain text only: no markdown and no tables. For several orders use short lines starting with "- ".
 8. Use the conversation to resolve follow-ups such as "and when does it ship?" or "what about the next one?".
-
+9. When the customer asks to see their recent orders, latest orders,
+   all orders, or a summary of their orders, list up to 10 orders
+   from the ORDERS DATA, newest order_date first. Do not ask for a PO
+   number when the customer is asking for an order list.
+10. When the customer specifies a date, date range, month, year,
+    order status, or another filter, select matching orders from
+    the ORDERS DATA. You may combine filters when the customer asks
+    for them. Show no more than 10 orders in one reply.
+11. If more than 10 orders match, show the 10 most relevant or
+    newest matching orders and briefly mention that more matching
+    orders exist. Never invent or assume orders outside the supplied
+    ORDERS DATA.
+12. For follow-up requests such as "show the next ones" or
+    "what about my other orders", use the conversation history to
+    avoid repeating orders already shown, where possible. If no
+    additional matching orders are available, say so clearly.
 Return JSON with these fields: reply (string), intent ("answer", "ticket" or "off_topic"), \
 po_no (the PO number the request is about, or "" if none)."""
 
@@ -261,16 +276,50 @@ def _ask_model(prompt: str) -> _ModelOut:
 
 
 # ---------------- output filter ----------------
-def _reply_is_safe(reply: str, owned: Set[str], company: str, others: Set[str]) -> bool:
-    if any(po not in owned for po in _extract_pos(reply)):
+
+def _reply_is_safe(
+    reply: str,
+    owned: Set[str],
+    company: str,
+    others: Set[str],
+    tracking_numbers: Set[str],
+) -> bool:
+    found_pos = _extract_pos(reply)
+
+    if any(po not in owned for po in found_pos):
+        log.warning("Safety filter: PO ownership check failed")
         return False
-    if _EMAIL_RE.search(reply) or _CID_RE.search(reply) or _INTERNAL_RE.search(reply):
+
+    if _EMAIL_RE.search(reply):
+        log.warning("Safety filter: email detected")
         return False
+
+    # Remove verified tracking numbers before checking for customer IDs.
+    checked_text = reply
+    for tracking_no in tracking_numbers:
+        checked_text = checked_text.replace(tracking_no, " ")
+
+    if _CID_RE.search(checked_text):
+        log.warning("Safety filter: customer ID detected")
+        return False
+
+    if _INTERNAL_RE.search(reply):
+        log.warning("Safety filter: internal information detected")
+        return False
+
     text = reply.lower()
-    for own in (company.lower(), _base_name(company).lower()):  # own name is allowed
+
+    for own in (company.lower(), _base_name(company).lower()):
         if own:
             text = text.replace(own, " ")
-    return not any(name in text for name in others)
+
+    for name in others:
+        if name in text:
+            log.warning("Safety filter: another company name detected")
+            return False
+
+    return True
+
 
 
 # ---------------- public entry point ----------------
@@ -328,9 +377,43 @@ def answer(customer_id: str, company_name: str, message: str, history: List[dict
         return {"reply": OFF_TOPIC_REPLY, "ticket_id": None}
 
     reply = out.reply.strip()[:1200]
+
+    # Never expose the authenticated customer's internal ID.
+    # Other customer IDs remain blocked by the safety filter.
+    # Preserve exact tracking numbers from verified database records.
+    tracking_map = {
+        o["tracking_no"]: o["tracking_no"]
+        for o in orders
+        if o.get("tracking_no")
+    }
+
+    # Temporarily protect tracking numbers before customer-ID redaction.
+    for index, tracking_no in enumerate(tracking_map):
+        reply = reply.replace(tracking_no, f"TRACKINGPLACEHOLDER{index}END")
+
+    # Redact the authenticated customer's standalone internal ID.
+    reply = re.sub(
+        rf"(?<![A-Za-z0-9]){re.escape(customer_id)}(?![A-Za-z0-9])",
+        "your account",
+        reply,
+        flags=re.IGNORECASE,
+    )
+
+    # Restore verified tracking numbers exactly.
+    for index, tracking_no in enumerate(tracking_map):
+        reply = reply.replace(f"TRACKINGPLACEHOLDER{index}END", tracking_no)
+
+
     if not reply:
         return {"reply": SAFE_FALLBACK_REPLY, "ticket_id": None}
-    if not _reply_is_safe(reply, owned, company_name, _other_company_names(customer_id)):
-        log.warning("Model reply blocked by the output filter (customer %s)", customer_id)
+
+    if not _reply_is_safe(
+        reply,
+        owned,
+        company_name,
+        _other_company_names(customer_id),
+        set(tracking_map.keys()),
+    ):
         return {"reply": SAFE_FALLBACK_REPLY, "ticket_id": None}
+
     return {"reply": reply, "ticket_id": None}
